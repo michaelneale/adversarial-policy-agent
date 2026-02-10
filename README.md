@@ -11,8 +11,8 @@ Primary agent wants to run `bash` tool call
 Extension intercepts via `tool_call` event
         │
         ▼
-Spawns `pi -p --no-session` subprocess
-with the command + your rules
+Calls LLM directly via pi-ai (completeSimple)
+same model + API key, no subprocess
         │
         ▼
 Adversary LLM returns ALLOW or BLOCK
@@ -21,7 +21,9 @@ Adversary LLM returns ALLOW or BLOCK
         └─ BLOCK → command is rejected, agent sees generic error
 ```
 
-The adversary runs in a completely separate context — its own process, its own LLM call, no shared state with the primary agent. The primary agent cannot influence or bypass the review.
+The adversary calls the LLM directly using `completeSimple` from `@mariozechner/pi-ai` — no subprocess, no pi bootstrap overhead. It uses the same model and API key as the primary agent. The call has its own system prompt and context, completely separate from the primary agent's conversation.
+
+The adversary is asked to respond with `ALLOW` or `BLOCK` on the first line, then a reason. The extension looks for the word BLOCK — anything else (including garbled output) is treated as ALLOW.
 
 ## Quick start
 
@@ -43,20 +45,14 @@ Without `--adversary`, the extension is completely inert — no overhead, no sub
 
 ## What the adversary sees
 
-The adversary LLM gets exactly three things:
+The adversary LLM gets:
 
 1. **The user's original task** — the first prompt from the session
-2. **The bash command** being reviewed
-3. **The rules** from `~/.pi/agent/adversary.md`
+2. **The last 4 user messages** — pulled from the session history, truncated to 200 chars each
+3. **The bash command** being reviewed
+4. **The rules** from `~/.pi/agent/adversary.md`
 
-It does **not** get:
-- The conversation history
-- Previous tool calls or results
-- What files have been read/written
-- The primary agent's reasoning
-- The system prompt
-
-This is intentional — the adversary evaluates each command in isolation against the rules, with only the original task for context.
+It does **not** get the agent's reasoning, tool results, file contents, or system prompt. The user messages give enough context to understand intent without exposing the agent's internal state.
 
 ## What the agent sees when blocked
 

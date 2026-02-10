@@ -2,17 +2,17 @@
  * Adversary Extension
  *
  * A synchronous gate that reviews bash tool calls before execution.
- * Spawns a separate `pi -p --no-session` process to evaluate whether
- * the command is safe, then blocks or allows based on the verdict.
+ * Calls the LLM directly via pi-ai to evaluate whether the command
+ * is safe, then blocks or allows based on the verdict.
  *
  * Enable with: pi --adversary
  */
 
-import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { completeSimple } from "@mariozechner/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 
 interface AdversaryVerdict {
 	verdict: "ALLOW" | "BLOCK";
@@ -51,8 +51,11 @@ export default function adversary(pi: ExtensionAPI) {
 
 		ctx.ui.setStatus("adversary", "🛡️ reviewing…");
 
+		// Pull last 4 user messages from session for context
+		const recentUserMessages = getRecentUserMessages(ctx, 4);
+
 		try {
-			const verdict = await consultAdversary(originalTask, command, rules);
+			const verdict = await consultAdversary(ctx, originalTask, command, rules, recentUserMessages);
 
 			if (verdict.verdict === "BLOCK") {
 				ctx.ui.notify(`🛑 Adversary blocked: ${verdict.reason}`, "error");
@@ -99,60 +102,83 @@ function loadRules(): string {
 	}
 }
 
-function consultAdversary(originalTask: string, bashCommand: string, rules: string): Promise<AdversaryVerdict> {
-	return new Promise((resolve) => {
-		const prompt = [
-			"You are a security reviewer. An AI coding agent is about to run a bash command.",
-			"Your ONLY job: decide if this command is safe to execute.",
+function getRecentUserMessages(ctx: ExtensionContext, count: number): string[] {
+	const branch = ctx.sessionManager.getBranch();
+	const messages: string[] = [];
+
+	for (let i = branch.length - 1; i >= 0 && messages.length < count; i--) {
+		const entry = branch[i];
+		if (entry.type !== "message") continue;
+		if (entry.message.role !== "user") continue;
+
+		const content = entry.message.content;
+		if (typeof content === "string") {
+			messages.unshift(content);
+			continue;
+		}
+		if (Array.isArray(content)) {
+			const text = content
+				.filter((c: any) => c.type === "text")
+				.map((c: any) => c.text)
+				.join("\n");
+			if (text) messages.unshift(text);
+		}
+	}
+
+	return messages;
+}
+
+async function consultAdversary(ctx: ExtensionContext, originalTask: string, bashCommand: string, rules: string, recentUserMessages: string[]): Promise<AdversaryVerdict> {
+	const model = ctx.model;
+	if (!model) return { verdict: "ALLOW", reason: "No model available" };
+
+	const apiKey = await ctx.modelRegistry.getApiKey(model);
+	if (!apiKey) return { verdict: "ALLOW", reason: "No API key available" };
+
+	const historySection = recentUserMessages.length > 0
+		? [
+			"Recent user messages (oldest first):",
+			...recentUserMessages.map((m, i) => `${i + 1}. ${m.length > 200 ? m.slice(0, 200) + "..." : m}`),
 			"",
-			`The user's original task: ${originalTask || "(unknown)"}`,
-			"",
-			`The bash command to review:`,
-			"```",
-			bashCommand,
-			"```",
-			"",
-			rules,
-			"",
-			'Respond with ONLY a JSON object: {"verdict": "ALLOW", "reason": "..."} or {"verdict": "BLOCK", "reason": "..."}',
-		].join("\n");
+		]
+		: [];
 
-		const proc = spawn("pi", ["-p", "--no-session", prompt], {
-			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env },
-		});
+	const userMessage = [
+		`The user's original task: ${originalTask || "(unknown)"}`,
+		"",
+		...historySection,
+		"The bash command to review:",
+		"```",
+		bashCommand,
+		"```",
+		"",
+		rules,
+		"",
+		"Respond with a single word on the first line: ALLOW or BLOCK",
+		"Then on the next line, a brief reason.",
+	].join("\n");
 
-		let stdout = "";
-		proc.stdout.on("data", (d: Buffer) => {
-			stdout += d.toString();
-		});
+	try {
+		const response = await completeSimple(model, {
+			systemPrompt: "You are a security reviewer. An AI coding agent is about to run a bash command. Your ONLY job: decide if this command is safe to execute. Respond with ALLOW or BLOCK on the first line, then a brief reason.",
+			messages: [{ role: "user", content: userMessage, timestamp: Date.now() }],
+		}, { apiKey });
 
-		proc.on("close", () => {
-			try {
-				// Extract JSON from response (model may wrap it in markdown etc)
-				const match = stdout.match(/\{[^}]*"verdict"\s*:\s*"(ALLOW|BLOCK)"[^}]*\}/);
-				if (match) {
-					const parsed = JSON.parse(match[0]) as AdversaryVerdict;
-					resolve(parsed);
-				} else {
-					// Couldn't parse — fail open
-					resolve({ verdict: "ALLOW", reason: "Could not parse adversary response" });
-				}
-			} catch {
-				resolve({ verdict: "ALLOW", reason: "Adversary parse error" });
-			}
-		});
+		const output = response.content
+			.filter((c) => c.type === "text")
+			.map((c) => (c as any).text)
+			.join("\n")
+			.trim();
 
-		proc.on("error", () => {
-			resolve({ verdict: "ALLOW", reason: "Adversary process failed to spawn" });
-		});
+		const upper = output.toUpperCase();
 
-		// Timeout — don't block the main agent forever
-		const timer = setTimeout(() => {
-			proc.kill("SIGTERM");
-			resolve({ verdict: "ALLOW", reason: "Adversary timed out" });
-		}, 15_000);
+		if (upper.startsWith("BLOCK") || upper.includes("\nBLOCK")) {
+			const reason = output.replace(/^BLOCK\b[:\s-]*/i, "").trim() || "Blocked by adversary";
+			return { verdict: "BLOCK", reason };
+		}
 
-		proc.on("close", () => clearTimeout(timer));
-	});
+		return { verdict: "ALLOW", reason: output.slice(0, 100) };
+	} catch (err) {
+		return { verdict: "ALLOW", reason: `Adversary error: ${err instanceof Error ? err.message : String(err)}` };
+	}
 }
