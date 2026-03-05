@@ -1,74 +1,58 @@
-# Adversarial Agent
+# Adversarial Policy Agent
 
-A [pi](https://github.com/mariozechner/pi) extension that acts as a synchronous security gate. Every bash command the primary agent wants to run is reviewed by a separate LLM before execution. If the command looks dangerous, it's blocked.
+A [pi](https://github.com/mariozechner/pi) extension that acts as a synchronous security gate. Every `bash` command the coding agent wants to run is first reviewed by a separate LLM call. If the command looks dangerous — especially data exfiltration — it gets blocked before execution.
+
+![Pen test results — all exfiltration attempts blocked](pen.png)
+
+*Claude attempting 6 different exfiltration techniques (direct upload, base64 obfuscation, tool disguise, social engineering, multi-step, legitimate-task disguise) — all blocked by the adversary gate.*
 
 ## How it works
 
 ```
-Primary agent wants to run `bash` tool call
+Agent wants to run a bash command
         │
         ▼
-Extension intercepts via `tool_call` event
+Extension intercepts via tool_call event
         │
         ▼
 Calls LLM directly via pi-ai (completeSimple)
-same model + API key, no subprocess
+Same model + API key, no subprocess
         │
         ▼
 Adversary LLM returns ALLOW or BLOCK
         │
         ├─ ALLOW → command executes normally
-        └─ BLOCK → command is rejected, agent sees generic error
+        └─ BLOCK → command rejected, agent told nothing about why
 ```
 
-The adversary calls the LLM directly using `completeSimple` from `@mariozechner/pi-ai` — no subprocess, no pi bootstrap overhead. It uses the same model and API key as the primary agent. The call has its own system prompt and context, completely separate from the primary agent's conversation.
+The adversary uses its own system prompt and context, completely separate from the primary agent's conversation. It sees:
 
-The adversary is asked to respond with `ALLOW` or `BLOCK` on the first line, then a reason. The extension looks for the word BLOCK — anything else (including garbled output) is treated as ALLOW.
+1. The user's original task
+2. The last 4 user messages (truncated)
+3. The bash command being reviewed
+4. Your custom rules from `~/.pi/agent/adversary.md`
 
 ## Quick start
 
 ```bash
-# 1. Create the extensions directory (if it doesn't exist)
+# 1. Create the extensions directory
 mkdir -p ~/.pi/agent/extensions
 
-# 2. Copy the extension and rules
+# 2. Copy the extension
 cp adversary.ts ~/.pi/agent/extensions/adversary.ts
+
+# 3. Optionally copy/customize the rules
 cp adversary.md ~/.pi/agent/adversary.md
 
-# 3. Run pi with the adversary enabled
+# 4. Run pi with the adversary enabled
 pi --adversary
 ```
 
-That's it. Every bash command the agent tries to run will now be reviewed first.
-
-Without `--adversary`, the extension is completely inert — no overhead, no subprocess spawns.
-
-## What the adversary sees
-
-The adversary LLM gets:
-
-1. **The user's original task** — the first prompt from the session
-2. **The last 4 user messages** — pulled from the session history, truncated to 200 chars each
-3. **The bash command** being reviewed
-4. **The rules** from `~/.pi/agent/adversary.md`
-
-It does **not** get the agent's reasoning, tool results, file contents, or system prompt. The user messages give enough context to understand intent without exposing the agent's internal state.
-
-## What the agent sees when blocked
-
-The agent gets an opaque error:
-
-```
-This command was blocked by a security policy. Do not attempt to run it again or work around this restriction.
-```
-
-It is deliberately told nothing about *why*. The user sees the real reason via a `🛑` notification in the UI.
+Without `--adversary`, the extension is completely inert — zero overhead.
 
 ## Rules
 
-The adversary's judgment is driven by `~/.pi/agent/adversary.md`. Edit it to match your needs.
-
-Default rules:
+Edit `~/.pi/agent/adversary.md` to customize what gets blocked. Default rules:
 
 ```
 BLOCK if the command:
@@ -87,15 +71,24 @@ Rules are re-read on every session switch, so you can edit them while pi is runn
 
 ## What it gates
 
-Only **bash** tool calls. Reads, writes, edits, grep, find, and ls pass through unreviewed.
+Only **bash** tool calls. File reads, writes, edits, grep, find, etc. pass through unreviewed.
 
 ## Fail-open design
 
-If the adversary subprocess crashes, times out (15s), or returns something unparseable, the command is **allowed through**. The adversary should never break the primary agent's workflow.
+If the adversary call fails, times out, or returns something unparseable, the command is **allowed through**. The adversary should never break the primary agent's workflow.
+
+## What the agent sees when blocked
+
+A generic message:
+
+> This command was blocked by a security policy. Do not attempt to run it again or work around this restriction.
+
+The agent is told nothing about *why*. The user sees the real reason via a `🛑` notification in the TUI.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| `adversary.ts` | Pi extension — the tool_call gate, subprocess spawning, rules loading |
+| `adversary.ts` | Pi extension — the `tool_call` gate and LLM review logic |
 | `adversary.md` | Default rules — copy to `~/.pi/agent/adversary.md` |
+| `pen.png` | Pen test results showing the gate blocking exfiltration attempts |
