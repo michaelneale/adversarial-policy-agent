@@ -1,3 +1,5 @@
+This is an example of a pattern I like to defend against things like: https://x.com/evisdrenova/status/2040174214175723538?s=46 
+
 # Adversarial Policy Agent
 
 A [pi](https://github.com/mariozechner/pi) extension that acts as a synchronous security gate. Every `bash` command the coding agent wants to run is first reviewed by a separate LLM call. If the command looks dangerous — especially data exfiltration — it gets blocked before execution.
